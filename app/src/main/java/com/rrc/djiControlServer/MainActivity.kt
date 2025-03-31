@@ -4,14 +4,6 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
-import androidx.appcompat.app.AppCompatActivity
-
-import io.ktor.features.*
-import io.ktor.http.*
-import io.ktor.response.*
-import io.ktor.server.engine.embeddedServer
-import io.ktor.server.netty.Netty
-import io.ktor.websocket.*
 import android.net.wifi.WifiManager
 import android.os.*
 import android.text.format.Formatter
@@ -19,6 +11,7 @@ import android.util.Base64
 import android.util.Log
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import dji.common.camera.SettingsDefinitions
 import dji.common.error.DJIError
@@ -30,23 +23,24 @@ import dji.common.gimbal.RotationMode
 import dji.common.util.CommonCallbacks
 import dji.sdk.base.BaseComponent
 import dji.sdk.base.BaseProduct
-import dji.sdk.media.DownloadListener
-import dji.sdk.media.FetchMediaTask
-import dji.sdk.media.MediaManager
-import dji.sdk.media.order.MediaRequest
+import dji.sdk.base.DJIDiagnostics
 import dji.sdk.products.Aircraft
 import dji.sdk.sdkmanager.DJISDKInitEvent
 import dji.sdk.sdkmanager.DJISDKManager
 import io.ktor.application.*
+import io.ktor.features.*
 import io.ktor.gson.*
+import io.ktor.http.*
+import io.ktor.response.*
 import io.ktor.routing.*
+import io.ktor.server.engine.embeddedServer
+import io.ktor.server.netty.Netty
+import io.ktor.websocket.*
 import kotlinx.coroutines.Runnable
 import kotlinx.coroutines.delay
 import java.io.ByteArrayOutputStream
-import java.nio.ByteBuffer
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
-import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.pow
 
@@ -523,45 +517,43 @@ class MainActivity : AppCompatActivity(), DJISDKManager.SDKManagerCallback {
     private fun Route.cameraControl() {
 
         get("/captureShot") {
-
             // Availability Checks
-            if(drone == null)
-                return@get call.respond(CommandCompleted(false, "Drone not Available"))
-            if(drone!!.camera == null)
-                return@get call.respond(CommandCompleted(false, "Camera not Available"))
-            if(drone!!.camera!!.mediaManager == null)
+            val droneCamera = drone?.camera
+                ?: return@get call.respond(CommandCompleted(false, "Camera not Available"))
+
+            if (droneCamera.mediaManager == null)
                 return@get call.respond(CommandCompleted(false, "Media Manager Not Available"))
-            if(!drone!!.camera!!.isFlatCameraModeSupported)
-                return@get call.respond(CommandCompleted(false, "Only Flat-Camera Mode is supported"))
 
-            // Get out of playback mode if in it
-            suspendCoroutine<DJIError?> { cont ->
-                drone!!.camera!!.exitPlayback { error ->
-                    cont.resume(error)
-                }
-            }
-
+            // Set to photo mode
             val flatModeError = suspendCoroutine<DJIError?> { cont ->
-                drone!!.camera!!.setFlatMode(SettingsDefinitions.FlatCameraMode.PHOTO_SINGLE) { error ->
+                droneCamera.setMode(SettingsDefinitions.CameraMode.SHOOT_PHOTO) { error ->
                     cont.resume(error)
                 }
             }
+            if (flatModeError != null)
+                return@get call.respond(CommandCompleted(false, "Error in setting mode: ${flatModeError.description}"))
 
-            if(flatModeError != null)
-                return@get call.respond(CommandCompleted(false, "Error in setting flat mode: " + flatModeError.description))
+            // Set shoot mode
+            val shootModeError = suspendCoroutine<DJIError?> { cont ->
+                droneCamera.setShootPhotoMode(SettingsDefinitions.ShootPhotoMode.SINGLE) { error ->
+                    cont.resume(error)
+                }
+            }
+            if (shootModeError != null)
+                return@get call.respond(CommandCompleted(false, "Error in setting shoot mode: ${shootModeError.description}"))
 
+            // Take a photo
             val singleShotError = suspendCoroutine<DJIError?> { cont ->
-                drone!!.camera!!.startShootPhoto { error ->
+                droneCamera.startShootPhoto { error ->
                     cont.resume(error)
                 }
             }
-
-            if(singleShotError != null)
-                return@get call.respond(CommandCompleted(false, "Error in taking single shot" +  singleShotError.description))
+            if (singleShotError != null)
+                return@get call.respond(CommandCompleted(false, "Error in taking single shot: ${singleShotError.description}"))
 
             return@get call.respond(CommandCompleted(true, null))
-
         }
+
 
         get ("/startVideoRecording") {
             // Availability Checks
@@ -738,17 +730,6 @@ class MainActivity : AppCompatActivity(), DJISDKManager.SDKManagerCallback {
                 return@get call.respond(CommandCompleted(false, "Camera not Available"))
             if(drone!!.camera!!.mediaManager == null)
                 return@get call.respond(CommandCompleted(false, "Media Manager Not Available"))
-            if(!drone!!.camera!!.isFlatCameraModeSupported)
-                return@get call.respond(CommandCompleted(false, "Only Flat-Camera Mode is supported"))
-
-            var exitPlaybackError = suspendCoroutine<DJIError?> { cont ->
-                drone!!.camera!!.exitPlayback { error ->
-                    cont.resume(error)
-                }
-            }
-
-            if(exitPlaybackError != null)
-                return@get call.respond(CommandCompleted(false, "Error in initial Playback mode exit: " + exitPlaybackError.description))
 
             // Refresh File List
             val refreshError = suspendCoroutine<DJIError?> { cont ->
@@ -785,24 +766,10 @@ class MainActivity : AppCompatActivity(), DJISDKManager.SDKManagerCallback {
                     return@get call.respond(CommandCompleted(false, "Error in fetching preview: " + previewFetchError.description + " Target File Name: " + targetFile.fileName))
             }
 
-            // Convert image to base64 string
             val previewString = bitmapToString(targetFile.preview)
-
-            // Exit Playback Mode
-            exitPlaybackError = suspendCoroutine { cont ->
-                drone!!.camera!!.exitPlayback { error ->
-                    cont.resume(error)
-                }
-            }
-
-            if(exitPlaybackError != null)
-                return@get call.respond(CommandCompleted(false, "Error in exiting playback mode: " + exitPlaybackError.description))
-
-            // Return Preview String
             return@get call.respond(DroneState(previewString))
 
         }
-
     }
 
     private fun Route.takeoffAndLandControl() {
